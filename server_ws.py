@@ -217,9 +217,10 @@ class Servidor:
             self.invitaciones.pop(str(msg.get("usuario") or "").strip().lower(), None)
             await cliente.enviar({"tipo": "INVITACIONES_BORRADAS"})
 
-    async def atender(self, ws, path="/"):
+    async def atender(self, ws, *args):
         """Atiende a un jugador desde que se conecta hasta que se va."""
         cliente = Cliente(ws)
+        path = getattr(getattr(ws, "request", None), "path", "/")
         log(f"Conexion nueva desde {cliente.direccion} (path: {path})")
         try:
             async for mensaje in ws:
@@ -250,13 +251,18 @@ class Servidor:
             self._limpiar_invitaciones_viejas()
 
 
-async def health_check(path, request_headers):
-    """Maneja el health check HTTP de Render y solo permite WS en /ws."""
-    if path == "/":
-        return http.HTTPStatus.OK, [], b"OK"
-    if path == "/ws":
+def health_check(arg1, arg2=None):
+    """Maneja el health check HTTP de Render y permite el handshake WebSocket.
+    Compatible con websockets moderno (conn, req) y legado (path, headers)."""
+    # API moderna de websockets (conn, req)
+    if hasattr(arg1, "respond") and hasattr(arg2, "path"):
+        if arg2.path == "/":
+            return arg1.respond(http.HTTPStatus.OK, "OK\n")
         return None
-    return http.HTTPStatus.NOT_FOUND, [], b"Not Found"
+    # API legada de websockets (path, headers)
+    if arg1 == "/":
+        return http.HTTPStatus.OK, [], b"OK\n"
+    return None
 
 
 async def principal(host, puerto):
