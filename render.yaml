@@ -1,0 +1,5 @@
+services:
+  - type: web
+    name: uaibot-server-ws
+    env: docker
+    plan: free
