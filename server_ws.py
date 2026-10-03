@@ -12,7 +12,7 @@ Que hace:
   - Crea salas con un CODIGO unico de 6 numeros.
   - Deja que otro jugador se una con ese codigo.
   - Mantiene muchas salas al mismo tiempo, cada una separada de las otras.
-  - Reenvia los mensajes del jugador A al B y del B al A (sin cambiarlos).
+  - Reenvia los mensajes entre los jugadores de la sala (1v1 o 2v2 con 4 jugadores).
   - Avisa cuando un jugador se desconecta.
   - Guarda en memoria las invitaciones entre amigos (duran 90 segundos).
 
@@ -32,7 +32,7 @@ import time
 
 import websockets
 
-MAX_JUGADORES_POR_SALA = 2          # el juego online es 1 contra 1
+MAX_JUGADORES_POR_SALA = 4          # 2 contra 2 (Equipo Azul y Equipo Rojo)
 MAX_LARGO_MENSAJE = 64 * 1024       # 64 KB por mensaje como maximo
 DURACION_INVITACION = 90            # segundos
 SALA_VACIA_MAXIMO = 2 * 60 * 60     # una sala esperando rival se borra a las 2 horas
@@ -41,7 +41,24 @@ TIEMPO_SIN_DATOS = 10 * 60          # (timeout)
 COMANDOS_SERVIDOR = {
     "CREAR_SALA", "UNIRSE_SALA", "SALIR_SALA", "LISTAR_SALAS",
     "INVITAR", "VER_INVITACIONES", "BORRAR_INVITACIONES", "PING",
+    "EN_VIVO", "ESPECTAR", "DEJAR_ESPECTAR", "REVANCHA",
 }
+
+
+def capacidad_para(modo):
+    """Cuantos jugadores entran en la sala segun el modo ('1v1', '2v2:CRISTALES', ...)."""
+    return MAX_JUGADORES_POR_SALA if str(modo).startswith("2v2") else 2
+
+
+def es_modo_arena(modo):
+    """Salas de arena ('2v2:...' o '1v1:...'): el servidor controla el orden de los turnos."""
+    modo = str(modo)
+    return ":" in modo or modo.startswith("2v2")
+
+
+def equipo_de(num):
+    """Jugadores 1 y 3 = Equipo Azul, 2 y 4 = Equipo Rojo."""
+    return "AZUL" if num % 2 == 1 else "ROJO"
 
 
 def log(*partes):
@@ -73,17 +90,37 @@ class Cliente:
 
 
 class Sala:
-    """Una partida: un codigo y los jugadores que estan adentro."""
+    """Una partida: un codigo y los jugadores que estan adentro.
+    Cada jugador tiene un puesto (1..4): 1 y 3 Equipo Azul, 2 y 4 Equipo Rojo.
+    El 1 (anfitrion) es el capitan azul y el 2 el capitan rojo."""
     def __init__(self, codigo, anfitrion, modo, publica):
         self.codigo = codigo
         self.anfitrion = anfitrion
         self.modo = modo
         self.publica = publica
         self.jugadores = [anfitrion]
+        self.puestos = {1: anfitrion}
+        anfitrion.num = 1
+        self.capacidad = capacidad_para(modo)
         self.creada = time.time()
+        self.empezada = False       # ya se mando SALA_LISTA / SALA_2V2_LISTA
+        self.turno_n = 0            # numero de la proxima accion de turno esperada
+        self.aviso = None           # SALA_LISTA de la partida en curso (para espectadores)
+        self.historial = []         # acciones de la partida en curso (para espectadores)
+        self.espectadores = []      # clientes mirando la partida
+        self.revancha = set()       # puestos que pidieron revancha
 
     def llena(self):
-        return len(self.jugadores) >= MAX_JUGADORES_POR_SALA
+        return len(self.jugadores) >= self.capacidad
+
+    def puesto_libre(self):
+        for n in range(1, self.capacidad + 1):
+            if n not in self.puestos:
+                return n
+        return None
+
+    def lista_jugadores(self):
+        return [{"num": n, "nombre": c.nombre, "equipo": equipo_de(n)} for n, c in sorted(self.puestos.items())]
 
 
 class Servidor:
@@ -100,21 +137,37 @@ class Servidor:
             if codigo not in self.salas:
                 return codigo
 
+    async def dejar_espectar(self, cliente):
+        sala = getattr(cliente, "espectando", None)
+        if sala and cliente in sala.espectadores:
+            sala.espectadores.remove(cliente)
+        cliente.espectando = None
+
     async def salir_de_sala(self, cliente, avisar=True):
         """Saca al jugador de su sala. Si queda alguien, le avisa que se fue."""
+        await self.dejar_espectar(cliente)
         sala = cliente.sala
         if not sala:
             return
         cliente.sala = None
+        num = getattr(cliente, "num", 0)
         if cliente in sala.jugadores:
             sala.jugadores.remove(cliente)
+        if sala.puestos.get(num) is cliente:
+            del sala.puestos[num]
+        sala.revancha.discard(num)
         if avisar:
-            for otro in sala.jugadores:
-                await otro.enviar({"tipo": "DESCONECTADO", "nombre": cliente.nombre})
+            for otro in sala.jugadores + sala.espectadores:
+                await otro.enviar({"tipo": "DESCONECTADO", "nombre": cliente.nombre,
+                                   "jugador_num": num, "jugadores": sala.lista_jugadores()})
         # Una sala sin jugadores, o sin anfitrion esperando, se borra
         if not sala.jugadores or cliente is sala.anfitrion:
             for otro in list(sala.jugadores):
                 otro.sala = None
+            for esp in list(sala.espectadores):
+                await esp.enviar({"tipo": "DESCONECTADO", "nombre": "", "jugador_num": 1, "jugadores": []})
+                esp.espectando = None
+            sala.espectadores = []
             self.salas.pop(sala.codigo, None)
             log(f"Sala {sala.codigo} cerrada")
 
@@ -126,7 +179,9 @@ class Servidor:
         self.salas[sala.codigo] = sala
         cliente.sala = sala
         log(f"Sala {sala.codigo} creada por {cliente.nombre} ({modo}, {'publica' if sala.publica else 'privada'})")
-        await cliente.enviar({"tipo": "SALA_CREADA", "codigo": sala.codigo, "modo": modo})
+        await cliente.enviar({"tipo": "SALA_CREADA", "codigo": sala.codigo, "modo": modo,
+                              "capacidad": sala.capacidad, "jugador_num": 1,
+                              "jugadores": sala.lista_jugadores()})
 
     async def unirse_sala(self, cliente, msg):
         codigo = str(msg.get("codigo") or "").replace("#", "").strip()
@@ -134,25 +189,56 @@ class Servidor:
         if not sala:
             await cliente.enviar({"tipo": "ERROR", "mensaje": f"La sala #{codigo} no existe."})
             return
-        if sala.llena():
+        if sala.llena() or sala.empezada:
             await cliente.enviar({"tipo": "ERROR", "mensaje": f"La sala #{codigo} ya esta llena."})
             return
         if cliente.sala is sala:
             return
         await self.salir_de_sala(cliente)
         cliente.nombre = str(msg.get("nombre") or cliente.nombre)[:30]
+        num = sala.puesto_libre()
+        cliente.num = num
+        sala.puestos[num] = cliente
         sala.jugadores.append(cliente)
         cliente.sala = sala
-        log(f"{cliente.nombre} entro a la sala {codigo}")
-        await cliente.enviar({"tipo": "UNIDO", "codigo": codigo, "modo": sala.modo, "rival": sala.anfitrion.nombre})
+        log(f"{cliente.nombre} entro a la sala {codigo} (puesto {num}, {equipo_de(num)})")
+        await cliente.enviar({"tipo": "UNIDO", "codigo": codigo, "modo": sala.modo, "rival": sala.anfitrion.nombre,
+                              "jugador_num": num, "capacidad": sala.capacidad,
+                              "jugadores": sala.lista_jugadores()})
         for otro in sala.jugadores:
             if otro is not cliente:
-                await otro.enviar({"tipo": "RIVAL_CONECTADO", "nombre": cliente.nombre})
+                await otro.enviar({"tipo": "RIVAL_CONECTADO", "nombre": cliente.nombre,
+                                   "jugador_num": num, "jugadores": sala.lista_jugadores()})
+        # Tablero clasico (1v1): la partida empieza al entrar el rival (se guarda para espectadores)
+        if sala.llena() and not es_modo_arena(sala.modo) and not sala.empezada:
+            sala.empezada = True
+            sala.aviso = {"tipo": "PARTIDA_CLASICA", "modo": sala.modo,
+                          "jugadores": {str(n): c.nombre for n, c in sala.puestos.items()}}
+            sala.historial = []
+        # Sala de arena completa: se reparten los equipos y empieza la partida
+        if sala.llena() and es_modo_arena(sala.modo) and not sala.empezada:
+            sala.empezada = True
+            sala.turno_n = 0
+            nombres = {str(n): c.nombre for n, c in sala.puestos.items()}
+            aviso = {
+                "tipo": "SALA_2V2_LISTA" if sala.capacidad == 4 else "SALA_LISTA",
+                "modo": sala.modo,
+                "equipos": {"azul": [sala.puestos[n].nombre for n in sorted(sala.puestos) if n % 2 == 1],
+                            "rojo": [sala.puestos[n].nombre for n in sorted(sala.puestos) if n % 2 == 0]},
+                "jugadores": nombres,
+                "semilla": random.randint(1, 10 ** 9),
+            }
+            log(f"Sala {codigo} lista: {aviso['equipos']}")
+            sala.aviso = aviso
+            sala.historial = []
+            for c in sala.jugadores:
+                await c.enviar(aviso)
 
     def lista_publica(self):
         """Salas publicas que todavia esperan rival."""
-        return [{"codigo": s.codigo, "nombre": s.anfitrion.nombre, "modo": s.modo}
-                for s in self.salas.values() if s.publica and not s.llena()]
+        return [{"codigo": s.codigo, "nombre": s.anfitrion.nombre, "modo": s.modo,
+                 "jugadores": len(s.jugadores), "capacidad": s.capacidad}
+                for s in self.salas.values() if s.publica and not s.llena() and not s.empezada]
 
     # ------------------------------------------------------ invitaciones
     def _limpiar_invitaciones_viejas(self):
@@ -179,6 +265,30 @@ class Servidor:
         if tipo not in COMANDOS_SERVIDOR:
             # Mensaje del juego: reenviarlo tal cual al/los rival(es) de la sala
             sala = cliente.sala
+            if sala and es_modo_arena(sala.modo) and tipo == "TURNO_ACCION" and "n" in msg:
+                # Turnos sincronizados: solo pasa la accion que toca, del jugador que toca
+                # (el anfitrion puede jugar por un compañero que se desconecto)
+                try:
+                    n = int(msg.get("n"))
+                    jid = int(msg.get("jugador_id", 0))
+                except (TypeError, ValueError):
+                    n, jid = -1, 0
+                esperado = (sala.turno_n % sala.capacidad) + 1
+                permitido = getattr(cliente, "num", 0) == jid or cliente is sala.anfitrion
+                if n != sala.turno_n or jid != esperado or not permitido:
+                    await cliente.enviar({"tipo": "TURNO_RECHAZADO", "n_esperado": sala.turno_n,
+                                          "jugador_esperado": esperado})
+                    return
+                if msg.get("fin_turno", True):
+                    sala.turno_n += 1
+                sala.historial.append(msg)
+                for esp in list(sala.espectadores):
+                    await esp.enviar(msg)
+            elif sala and sala.aviso and tipo in ("TURNO_ACCION", "FIN_PARTIDA"):
+                # tablero clasico: se guarda la jugada para los espectadores
+                sala.historial.append(msg)
+                for esp in list(sala.espectadores):
+                    await esp.enviar(msg)
             if sala:
                 for otro in sala.jugadores:
                     if otro is not cliente:
@@ -187,6 +297,48 @@ class Servidor:
 
         if tipo == "PING":
             await cliente.enviar({"tipo": "PONG"})
+        elif tipo == "EN_VIVO":
+            partidas = [{"codigo": s.codigo, "modo": s.modo,
+                         "jugadores": [c.nombre for _n, c in sorted(s.puestos.items())],
+                         "espectadores": len(s.espectadores), "acciones": len(s.historial)}
+                        for s in self.salas.values() if s.aviso and s.empezada]
+            await cliente.enviar({"tipo": "EN_VIVO", "partidas": partidas})
+        elif tipo == "ESPECTAR":
+            sala = self.salas.get(str(msg.get("codigo") or "").replace("#", "").strip())
+            if not sala or not sala.aviso:
+                await cliente.enviar({"tipo": "ERROR", "mensaje": "Esa partida ya no esta en vivo."})
+                return
+            await self.dejar_espectar(cliente)
+            cliente.nombre = str(msg.get("nombre") or cliente.nombre)[:30]
+            sala.espectadores.append(cliente)
+            cliente.espectando = sala
+            log(f"{cliente.nombre} mira la sala {sala.codigo}")
+            await cliente.enviar({"tipo": "ESPECTANDO", "codigo": sala.codigo, "modo": sala.modo,
+                                  "sala_lista": sala.aviso, "historial": list(sala.historial)})
+        elif tipo == "DEJAR_ESPECTAR":
+            await self.dejar_espectar(cliente)
+        elif tipo == "REVANCHA":
+            sala = cliente.sala
+            if not sala or not sala.aviso:
+                await cliente.enviar({"tipo": "ERROR", "mensaje": "No hay partida para revancha."})
+                return
+            sala.revancha.add(getattr(cliente, "num", 0))
+            listos = len(sala.revancha)
+            for c in sala.jugadores:
+                await c.enviar({"tipo": "REVANCHA_ESTADO", "listos": listos, "total": sala.capacidad,
+                                "de": cliente.nombre})
+            if listos >= sala.capacidad and len(sala.jugadores) >= sala.capacidad:
+                aviso = dict(sala.aviso)
+                aviso["semilla"] = random.randint(1, 10 ** 9)
+                aviso["revancha"] = True
+                sala.aviso, sala.historial, sala.turno_n = aviso, [], 0
+                sala.revancha = set()
+                log(f"Revancha en la sala {sala.codigo}")
+                for c in sala.jugadores:
+                    await c.enviar(aviso if es_modo_arena(sala.modo) else {"tipo": "REVANCHA_LISTA"})
+                for esp in list(sala.espectadores):
+                    await esp.enviar({"tipo": "ESPECTANDO", "codigo": sala.codigo, "modo": sala.modo,
+                                      "sala_lista": aviso, "historial": []})
         elif tipo == "CREAR_SALA":
             await self.crear_sala(cliente, msg)
         elif tipo == "UNIRSE_SALA":
